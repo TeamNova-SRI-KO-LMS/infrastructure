@@ -1,0 +1,75 @@
+# Ephemeral stack for the end-to-end and performance suites.
+#
+#   docker compose -f compose/docker-compose.test.yml up -d --wait
+#   E2E_FRONTEND_URL=http://localhost:5174 npm run test:e2e   # in the testing repo
+#   docker compose -f compose/docker-compose.test.yml down -v
+#
+# Everything is disposable: no named volumes, no restart policy, distinct
+# ports so it can run beside a development stack, and a database that is
+# discarded with the stack. `--wait` blocks until every healthcheck passes,
+# which is what makes this usable from CI without a sleep.
+
+name: sri-ko-lms-test
+
+services:
+  mongo:
+    image: mongo:7
+    tmpfs:
+      # The whole database in memory. Faster, and there is nothing to clean up.
+      - /data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks: [sriko-test]
+
+  api:
+    build:
+      context: ${APP_PATH:-../../../SRI-KO_Application_Project/app}
+      dockerfile: ${INFRA_ROOT:-${PWD}}/docker/backend.Dockerfile
+      target: runtime
+      additional_contexts:
+        infra: ..
+      args:
+        BACKEND_DIR: ${BACKEND_DIR:-Backend}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 5001
+      MONGODB_URI: mongodb://mongo:27017/sriko_lms_e2e
+      # Fixed, obviously-fake values. This stack never holds real data, and a
+      # test that depends on a secret it cannot see is a test nobody can run.
+      JWT_SECRET: e2e-only-not-a-real-secret
+      SESSION_SECRET: e2e-only-not-a-real-secret
+      JWT_EXPIRE: 1d
+      FRONTEND_URL: http://localhost:5174
+      CORS_ORIGIN: http://localhost:5174
+      LOG_LEVEL: error
+    ports:
+      - "${API_PORT:-5002}:5001"
+    networks: [sriko-test]
+
+  web:
+    build:
+      context: ${APP_PATH:-../../../SRI-KO_Application_Project/app}
+      dockerfile: ${INFRA_ROOT:-${PWD}}/docker/frontend.Dockerfile
+      target: runtime
+      additional_contexts:
+        infra: ..
+      args:
+        FRONTEND_DIR: ${FRONTEND_DIR:-Frontend}
+        VITE_API_URL: /api
+        VITE_NODE_ENV: test
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT:-5174}:8080"
+    networks: [sriko-test]
+
+networks:
+  sriko-test:
+    driver: bridge
