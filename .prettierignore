@@ -1,0 +1,14 @@
+node_modules/
+dist/
+backups/
+*.log
+
+# Workflows are formatted for readability by whoever is debugging a failed
+# deploy, not for a formatter's idea of consistency. Prettier reflows the
+# multi-line `run:` blocks and the expression syntax in ways that make them
+# harder to scan; actionlint and yamllint check them instead.
+.github/workflows/
+action.yml
+
+# Generated
+package-lock.json
