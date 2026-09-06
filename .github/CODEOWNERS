@@ -1,0 +1,20 @@
+# Code owners for the infrastructure repository.
+#
+# A CODEOWNERS entry adds the named reviewer automatically and, combined with
+# "Require review from Code Owners" in branch protection, makes that review
+# mandatory. It exists here because a workflow change is the one change that
+# can be merged, look fine, and break every other repository's pipeline.
+#
+# Replace the placeholders with real GitHub handles before enabling the
+# branch-protection rule — an unresolvable owner blocks every PR.
+
+# Everything, by default.
+*                           @TeamNova-SRI-KO-LMS/maintainers
+
+# Deployment and release paths get an extra pair of eyes: these are the files
+# where a mistake reaches production rather than CI.
+/.github/workflows/deploy-production.yml   @TeamNova-SRI-KO-LMS/maintainers
+/.github/workflows/release.yml             @TeamNova-SRI-KO-LMS/maintainers
+/.github/workflows/publish-marketplace.yml @TeamNova-SRI-KO-LMS/maintainers
+/compose/docker-compose.prod.yml           @TeamNova-SRI-KO-LMS/maintainers
+/action.yml                                @TeamNova-SRI-KO-LMS/maintainers
