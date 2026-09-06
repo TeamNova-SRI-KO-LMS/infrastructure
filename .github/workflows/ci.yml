@@ -1,0 +1,361 @@
+# CI Pipeline — infrastructure
+#
+# Implements the stages SENG 34213 §7.2 requires, applied to infrastructure
+# rather than to application code. The mapping:
+#
+#   §7.2 Lint & Format     → actionlint, hadolint, shellcheck, yamllint, prettier
+#   §7.2 Build             → both images built for real, on every push
+#   §7.2 Unit Tests        → compose configs validated; entrypoints and scripts exercised
+#   §7.2 Integration Tests → the whole stack booted, health-checked, smoke-tested
+#   §7.2 Security Scan     → Trivy on the built images, gitleaks on the history
+#
+# There is no unit-test tier for a Dockerfile. What replaces it is building the
+# image and running it: an infrastructure change that has never been executed
+# has not been tested, and "the YAML parses" is not a test.
+
+name: CI Pipeline
+
+on:
+  push:
+    branches: [develop, main, "feature/**", "fix/**", "ci/**"]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+# One run per ref. A second push while the first is still building the images
+# cancels it — the result would be discarded anyway.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  APP_REPOSITORY: TeamNova-SRI-KO-LMS/SRI-KO_LMS_MERN
+  APP_REF: develop
+
+jobs:
+  # ── Stage 1 · Lint & Format ────────────────────────────────────────────────
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the infrastructure
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install tooling
+        run: npm ci --no-audit --no-fund
+
+      # actionlint parses every workflow the way GitHub does, and catches the
+      # class of error that otherwise only appears when the workflow runs:
+      # an undefined `needs` reference, a bad `if` expression, a shell
+      # injection through an unquoted `${{ github.event.* }}`.
+      - name: Lint workflows (actionlint)
+        uses: raven-actions/actionlint@v2
+        with:
+          fail-on-error: true
+          shellcheck: true
+          pyflakes: false
+
+      - name: Lint Dockerfiles (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          recursive: true
+          dockerfile: "docker/*.Dockerfile"
+          failure-threshold: warning
+          # DL3018: alpine packages are pinned by the base image digest in the
+          # lockfile-equivalent sense; pinning apk versions here would break on
+          # every upstream patch release without improving reproducibility.
+          ignore: DL3018
+
+      - name: Lint shell scripts (shellcheck)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning scripts/*.sh
+
+      - name: Lint YAML (yamllint)
+        run: |
+          set -euo pipefail
+          pip install --quiet yamllint
+          yamllint --strict .
+
+      - name: Check formatting (prettier)
+        run: npm run format:check
+
+  # ── Stage 2 · Build ────────────────────────────────────────────────────────
+  build:
+    name: Build Images
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tier: backend
+            dockerfile: docker/backend.Dockerfile
+          - tier: frontend
+            dockerfile: docker/frontend.Dockerfile
+    steps:
+      - name: Check out the infrastructure
+        uses: actions/checkout@v6
+        with:
+          path: infrastructure
+
+      # The Dockerfiles build from the application repository root, because
+      # that is where Backend/ and Frontend/ are. Checking the application out
+      # here is what makes "does this Dockerfile still build?" a question CI
+      # can answer.
+      - name: Check out the application
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.APP_REPOSITORY }}
+          ref: ${{ env.APP_REF }}
+          path: app
+          token: ${{ secrets.APP_REPO_TOKEN || github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build ${{ matrix.tier }}
+        uses: docker/build-push-action@v7
+        with:
+          context: app
+          file: infrastructure/${{ matrix.dockerfile }}
+          target: runtime
+          push: false
+          load: true
+          tags: sri-ko-lms-${{ matrix.tier }}:ci
+          cache-from: type=gha,scope=${{ matrix.tier }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.tier }}
+          # The frontend image needs the nginx config, which lives in this
+          # repository rather than in the application's build context.
+          build-contexts: |
+            infra=infrastructure
+          build-args: |
+            BACKEND_DIR=${{ vars.APP_BACKEND_DIR || 'Backend' }}
+            FRONTEND_DIR=${{ vars.APP_FRONTEND_DIR || 'Frontend' }}
+            VITE_API_URL=/api
+            VITE_NODE_ENV=production
+
+      # An image that runs as root passes every other check in this pipeline
+      # and fails the one that matters. Asserted rather than assumed.
+      - name: Image does not run as root
+        run: |
+          set -euo pipefail
+          user="$(docker image inspect sri-ko-lms-${{ matrix.tier }}:ci --format '{{.Config.User}}')"
+          echo "Configured USER: '${user}'"
+          if [ -z "${user}" ] || [ "${user}" = "root" ] || [ "${user}" = "0" ]; then
+            echo "::error::sri-ko-lms-${{ matrix.tier }} runs as root."
+            exit 1
+          fi
+
+      - name: Export image for later stages
+        run: docker save sri-ko-lms-${{ matrix.tier }}:ci | gzip > ${{ matrix.tier }}.tar.gz
+
+      - name: Upload image
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ matrix.tier }}
+          path: ${{ matrix.tier }}.tar.gz
+          retention-days: 1
+
+  # ── Stage 3 · Unit ─────────────────────────────────────────────────────────
+  validate:
+    name: Validate Compose & Scripts
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v6
+
+      # `docker compose config` resolves interpolation, merges anchors and
+      # validates the schema. It is the closest thing a compose file has to a
+      # compiler, and it catches the required-variable typos that would
+      # otherwise surface as a failed deployment.
+      - name: Compose files are valid
+        run: |
+          set -euo pipefail
+          # --env-file rather than sourcing it: a Mongo URI's query string
+          # contains `&`, which is valid in an env file and a syntax error in
+          # `. ./file`.
+          for file in compose/docker-compose*.yml; do
+            echo "── ${file}"
+            docker compose --env-file .env.example -f "${file}" config --quiet
+          done
+          echo "✓ every compose file resolves"
+
+      - name: Deployment scripts are syntactically valid
+        run: |
+          set -euo pipefail
+          for script in scripts/*.sh; do
+            bash -n "${script}"
+            echo "✓ ${script}"
+          done
+
+      - name: The composite action declares what it promises
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, yaml
+          spec = yaml.safe_load(open('action.yml'))
+          missing = [k for k in ('name', 'description', 'author', 'branding', 'runs')
+                     if k not in spec]
+          if missing:
+              sys.exit(f"action.yml is missing required keys for Marketplace: {missing}")
+          if spec['runs'].get('using') != 'composite':
+              sys.exit("action.yml must be a composite action")
+          # Every step that a caller could reach must have a shell declared;
+          # a composite step without one fails at call time, not at lint time.
+          for i, step in enumerate(spec['runs'].get('steps', [])):
+              if 'run' in step and 'shell' not in step:
+                  sys.exit(f"step {i} ({step.get('name', '?')}) has `run` but no `shell`")
+          print(f"✓ action.yml is a valid composite action with "
+                f"{len(spec.get('inputs', {}))} inputs and "
+                f"{len(spec.get('outputs', {}))} outputs")
+          PY
+
+  # ── Stage 4 · Integration ──────────────────────────────────────────────────
+  integration:
+    name: Stack Boots & Answers
+    runs-on: ubuntu-latest
+    needs: [build, validate]
+    steps:
+      - name: Check out the infrastructure
+        uses: actions/checkout@v6
+
+      - name: Download images
+        uses: actions/download-artifact@v8
+        with:
+          pattern: image-*
+          merge-multiple: true
+
+      - name: Load images
+        run: |
+          set -euo pipefail
+          gunzip -c backend.tar.gz | docker load
+          gunzip -c frontend.tar.gz | docker load
+
+      # The real test of an infrastructure change: bring the stack up and use
+      # it. `--wait` blocks on the healthchecks, so a container that starts and
+      # immediately crashes fails here rather than timing out in a sleep.
+      - name: Bring up the stack
+        env:
+          BACKEND_IMAGE: sri-ko-lms-backend
+          FRONTEND_IMAGE: sri-ko-lms-frontend
+          IMAGE_TAG: ci
+        run: |
+          set -euo pipefail
+          docker compose -f compose/docker-compose.ci.yml up -d --wait --wait-timeout 180
+
+      - name: Smoke test
+        run: ./scripts/smoke-test.sh http://localhost:8080 http://localhost:5001
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f compose/docker-compose.ci.yml logs --no-color --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f compose/docker-compose.ci.yml down -v --remove-orphans
+
+  # ── Stage 5 · Security ─────────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download image
+        uses: actions/download-artifact@v8
+        with:
+          name: image-${{ matrix.tier }}
+
+      - name: Load image
+        run: gunzip -c ${{ matrix.tier }}.tar.gz | docker load
+
+      # Two Trivy runs on purpose. The first reports everything to the Security
+      # tab so findings are tracked over time; the second fails the build, and
+      # only on HIGH and CRITICAL with a fix available. Failing on an
+      # unfixable CVE teaches the team to bypass the gate.
+      - name: Scan ${{ matrix.tier }} (report)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: sri-ko-lms-${{ matrix.tier }}:ci
+          format: sarif
+          output: trivy-${{ matrix.tier }}.sarif
+          severity: LOW,MEDIUM,HIGH,CRITICAL
+
+      - name: Upload results to the Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-${{ matrix.tier }}.sarif
+          category: trivy-${{ matrix.tier }}
+        continue-on-error: true
+
+      - name: Scan ${{ matrix.tier }} (gate — §8.1 A06)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: sri-ko-lms-${{ matrix.tier }}:ci
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  secrets-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # gitleaks needs history: a secret removed in the tip commit is still
+          # a compromised secret, and it is still in every clone.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # ── Aggregate gate ─────────────────────────────────────────────────────────
+  pipeline:
+    name: CI Pipeline
+    runs-on: ubuntu-latest
+    needs: [lint, build, validate, integration, security, secrets-scan]
+    if: always()
+    steps:
+      # Branch protection points at this one check instead of six. Adding a
+      # stage then does not require reconfiguring protection — which is how a
+      # new stage ends up non-blocking without anyone deciding that.
+      - name: Every stage passed
+        run: |
+          set -euo pipefail
+          results='${{ join(needs.*.result, " ") }}'
+          echo "Stage results: ${results}"
+          case "${results}" in
+            *failure*|*cancelled*)
+              echo "::error::One or more CI stages did not pass."
+              exit 1
+              ;;
+          esac
+          echo "✓ all stages passed"
