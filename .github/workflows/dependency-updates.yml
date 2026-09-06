@@ -1,0 +1,171 @@
+# Dependency updates — the scheduled audit Dependabot does not do
+#
+# Dependabot opens a pull request when a dependency has a newer version. This
+# workflow answers a different question, weekly: *right now, is anything we
+# ship carrying a known high or critical vulnerability?* — including in the
+# base images, which Dependabot only checks when the tag changes, and
+# including advisories published against a version we are already on.
+#
+# §8.1 (A06) requires no high or critical vulnerabilities in dependencies.
+# §8.2 makes that a pipeline gate. A gate that only runs on push cannot catch
+# an advisory published on a Tuesday against code nobody touched that week —
+# which is how most of them arrive.
+#
+# The output is a GitHub issue, not a failed build. There is no build to fail
+# on a schedule, and an issue is something the next sprint planning can pick
+# up.
+
+name: Dependency Updates
+
+on:
+  schedule:
+    # Monday 09:00 Asia/Colombo (03:30 UTC), before the week's planning.
+    - cron: "30 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      create-issue:
+        description: "Open an issue even if nothing is found"
+        type: boolean
+        default: false
+
+concurrency:
+  group: dependency-updates
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Audit Dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    outputs:
+      vulnerable: ${{ steps.audit.outputs.vulnerable }}
+      outdated: ${{ steps.outdated.outputs.count }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      # `|| true` because npm audit exits non-zero on findings, and the
+      # findings are what we want to read rather than a stopped job. The gate
+      # is applied below, on the parsed count.
+      - name: npm audit
+        id: audit
+        run: |
+          set -uo pipefail
+          npm audit --json > audit.json || true
+
+          high=$(python3 -c "import json;d=json.load(open('audit.json'));print(d.get('metadata',{}).get('vulnerabilities',{}).get('high',0))")
+          critical=$(python3 -c "import json;d=json.load(open('audit.json'));print(d.get('metadata',{}).get('vulnerabilities',{}).get('critical',0))")
+          total=$((high + critical))
+
+          {
+            echo "high=${high}"
+            echo "critical=${critical}"
+            echo "vulnerable=${total}"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### npm audit"
+            echo ""
+            echo "| Severity | Count |"
+            echo "| --- | --- |"
+            echo "| Critical | ${critical} |"
+            echo "| High | ${high} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Outdated packages
+        id: outdated
+        run: |
+          set -uo pipefail
+          npm outdated --json > outdated.json || true
+          count=$(python3 -c "import json;print(len(json.load(open('outdated.json'))))" 2>/dev/null || echo 0)
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          {
+            echo ""
+            echo "### Outdated packages: ${count}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue for the findings
+        if: steps.audit.outputs.vulnerable != '0' || inputs.create-issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CRITICAL: ${{ steps.audit.outputs.critical }}
+          HIGH: ${{ steps.audit.outputs.high }}
+          OUTDATED: ${{ steps.outdated.outputs.count }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          title="chore(deps): ${CRITICAL} critical, ${HIGH} high advisories — week of $(date -u +%Y-%m-%d)"
+
+          {
+            printf '## Dependency audit\n\n'
+            printf 'Scheduled scan of the infrastructure repository.\n\n'
+            printf '| Severity | Count |\n| --- | --- |\n'
+            printf '| Critical | %s |\n| High | %s |\n' "${CRITICAL}" "${HIGH}"
+            printf '| Outdated packages | %s |\n\n' "${OUTDATED}"
+            printf '§8.2 requires no known high or critical vulnerabilities in\n'
+            printf 'dependencies, so a non-zero count here is a blocker for the\n'
+            printf 'next release rather than a backlog item.\n\n'
+            printf '**Details:** %s\n\n' "${RUN_URL}"
+            printf '### Next steps\n\n'
+            printf -- '- [ ] `npm audit fix` for anything with a compatible fix\n'
+            printf -- '- [ ] For advisories with no fix: assess reachability and record the decision here\n'
+            printf -- '- [ ] Check whether Dependabot already has a PR open for it\n'
+            printf -- '- [ ] Re-run this workflow to confirm the count is zero\n'
+          } > issue.md
+
+          # One issue per week at most: reopening the same finding every Monday
+          # trains everyone to close it unread.
+          existing=$(gh issue list --label "dependencies" --state open \
+            --search "in:title chore(deps)" --json number --jq '.[0].number' || true)
+
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue.md
+            echo "Commented on existing issue #${existing}"
+          else
+            gh issue create --title "${title}" --body-file issue.md \
+              --label "dependencies" --label "epic:security" --label "P2-Critical"
+          fi
+
+      - name: Fail if high or critical advisories are outstanding
+        if: steps.audit.outputs.vulnerable != '0'
+        run: |
+          echo "::error::${{ steps.audit.outputs.critical }} critical and ${{ steps.audit.outputs.high }} high advisories — see the issue opened above."
+          exit 1
+
+  base-images:
+    name: Audit Base Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - node:22-alpine
+          - nginxinc/nginx-unprivileged:1.27-alpine
+          - mongo:7
+    steps:
+      # Base images are where most container CVEs live, and they change
+      # without anything in this repository changing. Scanning them on a
+      # schedule is the only way to find out before a release does.
+      - name: Scan ${{ matrix.image }}
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.image }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

@@ -1,0 +1,53 @@
+# Dependency Review
+#
+# Runs on pull requests and compares the dependency manifest before and after.
+# It answers a question `npm audit` cannot: *this change* introduces a
+# vulnerable or badly licensed package.
+#
+# The distinction is what makes it useful. `npm audit` reports the whole tree,
+# so a pre-existing finding fails every PR and the team learns to ignore the
+# job. Dependency review only fails on what the PR adds, which means a red
+# result is always the author's to fix.
+
+name: Dependency Review
+
+on:
+  pull_request:
+    branches: [develop, main]
+
+concurrency:
+  group: dependency-review-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Review Dependency Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # to post the summary comment
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Review
+        uses: actions/dependency-review-action@v4
+        with:
+          # §8.2: no known high or critical vulnerabilities. Moderate findings
+          # are reported in the summary but do not block, because blocking on
+          # moderate means a transitive advisory in a dev tool stops a
+          # deployment fix.
+          fail-on-severity: high
+
+          # Copyleft licences are refused because this is coursework that may
+          # later be published, and a GPL dependency changes what the whole
+          # project may be licensed as. That is a decision for the team and
+          # the supervisor, not something that arrives inside a transitive
+          # dependency bump.
+          deny-licenses: GPL-3.0, AGPL-3.0, LGPL-3.0, SSPL-1.0
+
+          comment-summary-in-pr: on-failure
+          warn-only: false

@@ -1,0 +1,111 @@
+# Dependabot auto-merge
+#
+# Approves and enables auto-merge for the Dependabot pull requests that carry
+# no judgement: patch and minor updates, once CI is green.
+#
+# The reason to automate this is not laziness — it is that a queue of twenty
+# open dependency PRs is worse than none. Nobody reviews the twentieth, they
+# accumulate merge conflicts, and the security patch that actually mattered is
+# lost among them. Automating the boring 90 % is what keeps the remaining 10 %
+# reviewable.
+#
+# What is deliberately NOT automated:
+#
+#   * Major version bumps. A semver major is breaking by definition and needs
+#     a human to read the changelog. Those get a label and a checklist instead.
+#   * Anything targeting `main`. Production changes go through the release
+#     process, not through a bot.
+#
+# `gh pr merge --auto` merges only once every required status check passes, so
+# nothing here bypasses CI. It removes the human keystroke *after* CI has
+# already decided.
+
+name: Dependabot Auto-merge
+
+on:
+  pull_request_target:
+    branches: [develop]
+
+# `pull_request_target` runs with write access and the base repository's
+# secrets. Nothing from the pull request is checked out or evaluated here:
+# every value used below comes from the trusted metadata action or from
+# `github.event` fields that Dependabot itself controls, and each is passed
+# through an environment variable rather than interpolated into a shell
+# command — the difference between a safe workflow and a script-injection
+# vector.
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  auto-merge:
+    name: Auto-merge Dependabot PR
+    runs-on: ubuntu-latest
+    if: >-
+      github.actor == 'dependabot[bot]' &&
+      github.event.pull_request.user.login == 'dependabot[bot]'
+
+    steps:
+      - name: Read the update metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Approve
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEPENDENCY: ${{ steps.metadata.outputs.dependency-names }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr review --approve "${PR_URL}" \
+            --body "Approved automatically — ${UPDATE_TYPE} for ${DEPENDENCY}. Merges once every required check passes."
+
+      - name: Enable auto-merge
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh pr merge --auto --squash "${PR_URL}"
+
+      # A major bump gets a label and a checklist instead of a merge, so it
+      # appears in the review queue as work rather than sitting in the same
+      # pile as the automated ones.
+      - name: Flag a major update for review
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          DEPENDENCY: ${{ steps.metadata.outputs.dependency-names }}
+          PREVIOUS_VERSION: ${{ steps.metadata.outputs.previous-version }}
+          NEW_VERSION: ${{ steps.metadata.outputs.new-version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh pr edit "${PR_URL}" --add-label "needs-discussion"
+
+          {
+            printf '**Major version update — not auto-merged.**\n\n'
+            printf '`%s` is going from `%s` to `%s`.\n\n' \
+              "${DEPENDENCY}" "${PREVIOUS_VERSION}" "${NEW_VERSION}"
+            printf 'A semver major is breaking by definition. Before merging:\n\n'
+            printf -- '- [ ] Read the upstream changelog for the breaking changes\n'
+            printf -- '- [ ] Check whether any of them touch code in this repository\n'
+            printf -- '- [ ] Confirm CI is green, including the integration stage\n'
+            printf -- '- [ ] If it touches the deployment path, deploy to staging first\n'
+          } > comment.md
+
+          gh pr comment "${PR_URL}" --body-file comment.md
