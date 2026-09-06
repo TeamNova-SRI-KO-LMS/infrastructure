@@ -1,0 +1,84 @@
+# Dependabot — automated dependency updates.
+#
+# SENG 34213 §8.1 (A06) requires a dependency scan in the CI pipeline with no
+# high or critical vulnerabilities outstanding. `npm audit` in CI tells you a
+# vulnerability exists; Dependabot opens the pull request that fixes it. Both
+# are needed — a scan without a remediation path just produces a red build
+# nobody can clear.
+#
+# Grouping matters more than it looks. Ungrouped, a weekly run against four
+# ecosystems opens twenty single-dependency PRs, each needing a review and a
+# CI run, and the team stops reading them by week three. Grouped, it opens
+# four, and they get reviewed.
+#
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+updates:
+  # ── This repository's own tooling ─────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Colombo"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "epic:ci-cd"]
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      # Patch and minor updates travel together: they are the ones the
+      # auto-merge workflow can take without a human, so batching them means
+      # one green run instead of eight.
+      tooling-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ── GitHub Actions used by the workflows here ─────────────────────────────
+  # A pinned action that is never updated is a supply-chain risk that looks
+  # like caution. §8.1 A08 asks for integrity verification; keeping actions
+  # current is the other half of it.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Colombo"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "github-actions", "epic:ci-cd"]
+    commit-message:
+      prefix: "chore(deps-actions)"
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ── Base images ───────────────────────────────────────────────────────────
+  # node:22-alpine and nginx pick up CVE fixes in patch releases. This is the
+  # update that closes most container findings, and it is the one nobody
+  # remembers to do by hand.
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Colombo"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "docker", "epic:ci-cd"]
+    commit-message:
+      prefix: "chore(deps-docker)"
+    ignore:
+      # Node and nginx majors are a deliberate migration with a compatibility
+      # check, not a dependency bump. They are raised as an issue and
+      # scheduled; Dependabot opening the PR would suggest otherwise.
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "nginxinc/nginx-unprivileged"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "mongo"
+        update-types: ["version-update:semver-major"]
