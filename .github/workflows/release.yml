@@ -1,0 +1,240 @@
+# Release
+#
+# §3.3 requires every release to be tagged with Semantic Versioning, and pins
+# the sprint milestones to versions: Sprint 5 ships v0.1.0, Sprint 6 v0.2.0,
+# Sprint 7 v0.3.0, Sprint 8 v1.0.0.
+#
+# This workflow turns a tag into a release: it validates the tag, checks the
+# changelog was actually updated, builds and publishes the images at that tag,
+# writes release notes from the changelog, and publishes the GitHub Release.
+#
+# The order matters. Everything that can fail is checked *before* the release
+# is published, because a tag can be moved but a published release that
+# announces a broken build has already been read.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. v1.0.0"
+        type: string
+        required: true
+      prerelease:
+        description: "Mark as a pre-release"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Gate ───────────────────────────────────────────────────────────────────
+  validate:
+    name: Validate the Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      numeric: ${{ steps.version.outputs.numeric }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      notes: ${{ steps.notes.outputs.path }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and check the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="${INPUT_VERSION}"
+          else
+            version="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # SemVer, with the optional pre-release and build-metadata parts.
+          # A tag that does not match is refused here rather than producing a
+          # release whose version nobody can order against the others.
+          if ! printf '%s' "${version}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'${version}' is not a semantic version. Expected vMAJOR.MINOR.PATCH — see §3.3."
+            exit 1
+          fi
+
+          numeric="${version#v}"
+          prerelease=false
+          case "${version}" in *-*) prerelease=true ;; esac
+          if [ "${{ inputs.prerelease }}" = "true" ]; then prerelease=true; fi
+
+          {
+            echo "version=${version}"
+            echo "numeric=${numeric}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Releasing ${version} (prerelease: ${prerelease})"
+
+      # A release with no changelog entry is a release nobody can read. The
+      # Definition of Done requires CHANGELOG.md to be updated on every merge;
+      # this is where that requirement is finally enforced.
+      - name: Extract the release notes from CHANGELOG.md
+        id: notes
+        env:
+          NUMERIC: ${{ steps.version.outputs.numeric }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::CHANGELOG.md is missing."
+            exit 1
+          fi
+
+          python3 - <<'PY' > release-notes.md
+          import os, re, sys
+
+          version = os.environ["NUMERIC"]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+
+          # Everything between this version's heading and the next one.
+          pattern = rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)"
+          match = re.search(pattern, text, re.M | re.S)
+
+          if not match:
+              sys.stderr.write(
+                  f"::error::CHANGELOG.md has no section for [{version}]. "
+                  f"Promote the [Unreleased] section before tagging — a release "
+                  f"without notes is a release nobody can review.\n"
+              )
+              sys.exit(1)
+
+          body = match.group(1).strip()
+          if not body:
+              sys.stderr.write(f"::error::The [{version}] section in CHANGELOG.md is empty.\n")
+              sys.exit(1)
+
+          print(body)
+          PY
+
+          echo "path=release-notes.md" >> "$GITHUB_OUTPUT"
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Releases are cut from main
+        if: "!contains(github.ref, '-')"
+        run: |
+          set -euo pipefail
+          # A final release must be an ancestor of main. A pre-release may be
+          # cut from develop, which is what the `-rc.1` suffix is for.
+          git fetch origin main --depth=1
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_SHA} is not on main. Final releases are tagged on main (§3.2); use a -rc pre-release from develop instead."
+            exit 1
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 30
+
+  # ── Build the artefacts the release refers to ──────────────────────────────
+  images:
+    name: Publish Images
+    needs: validate
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      app-ref: ${{ needs.validate.outputs.version }}
+      image-tag: ${{ needs.validate.outputs.numeric }}
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+  # ── Publish ────────────────────────────────────────────────────────────────
+  publish:
+    name: Publish the GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate, images]
+    permissions:
+      contents: write        # to create the release
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download release notes
+        uses: actions/download-artifact@v8
+        with:
+          name: release-notes
+
+      - name: Assemble the release body
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          NUMERIC: ${{ needs.validate.outputs.numeric }}
+          BACKEND_DIGEST: ${{ needs.images.outputs.backend-digest }}
+          FRONTEND_DIGEST: ${{ needs.images.outputs.frontend-digest }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          {
+            cat release-notes.md
+            printf '\n\n---\n\n### Container images\n\n'
+            printf '| Image | Tag | Digest |\n| --- | --- | --- |\n'
+            printf '| `%s/sri-ko-lms-backend` | `%s` | `%s` |\n' \
+              "${DOCKERHUB_USERNAME}" "${NUMERIC}" "${BACKEND_DIGEST}"
+            printf '| `%s/sri-ko-lms-frontend` | `%s` | `%s` |\n\n' \
+              "${DOCKERHUB_USERNAME}" "${NUMERIC}" "${FRONTEND_DIGEST}"
+            printf 'Deploy this release with:\n\n'
+            printf '```bash\n'
+            printf 'IMAGE_TAG=%s ./scripts/deploy.sh production\n' "${NUMERIC}"
+            printf '```\n\n'
+            printf 'Both images carry a build-provenance attestation (§8.1 A08).\n'
+            printf 'Verify before deploying:\n\n'
+            printf '```bash\n'
+            printf 'gh attestation verify oci://ghcr.io/%s/sri-ko-lms-backend:%s \\\n' \
+              "${GITHUB_REPOSITORY_OWNER}" "${NUMERIC}"
+            printf '  --owner %s\n' "${GITHUB_REPOSITORY_OWNER}"
+            printf '```\n'
+          } > release-body.md
+
+          cat release-body.md
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: ${{ needs.validate.outputs.version }}
+          body_path: release-body.md
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          generate_release_notes: false
+          make_latest: ${{ needs.validate.outputs.prerelease != 'true' }}
+          files: |
+            compose/docker-compose.prod.yml
+            compose/docker-compose.staging.yml
+            scripts/deploy.sh
+            scripts/rollback.sh
+            scripts/smoke-test.sh
+
+      - name: Summary
+        run: |
+          {
+            echo "## Released ${{ needs.validate.outputs.version }}"
+            echo ""
+            echo "- Images published to Docker Hub and GHCR"
+            echo "- Provenance attested"
+            echo "- Deployment bundle attached"
+            echo ""
+            echo "Production deployment is a separate, manually approved workflow:"
+            echo "\`deploy-production.yml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
