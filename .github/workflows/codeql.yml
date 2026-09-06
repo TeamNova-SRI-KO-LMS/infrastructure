@@ -1,0 +1,73 @@
+# CodeQL Security Analysis
+#
+# SENG 34213 §8 asks for security to be verified rather than asserted. `npm
+# audit` covers §8.1 A06 — known vulnerabilities in dependencies. CodeQL covers
+# the other half: vulnerabilities in code this team wrote, which no dependency
+# scanner will ever find.
+#
+# In this repository that is the composite action and the deployment scripts.
+# It is a small surface, and it is the surface with the widest blast radius:
+# the action runs inside other people's workflows with their tokens, and the
+# scripts run on the deployment host.
+#
+# Requires code scanning to be enabled:
+#   Settings → Code security and analysis → Code scanning → Set up
+
+name: CodeQL
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+  schedule:
+    # Weekly, Monday 09:00 Asia/Colombo (03:30 UTC). The scheduled run matters
+    # more than the push runs: CodeQL ships new queries, so code that was clean
+    # in March can be found vulnerable in September without a line changing.
+    - cron: "30 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      security-events: write   # to upload SARIF to the Security tab
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, actions]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          # security-extended adds lower-precision queries that still find real
+          # bugs; security-and-quality adds maintainability rules. Both are
+          # affordable on a repository this size, and the noise they add is
+          # visible in the Security tab rather than in the build result.
+          queries: security-extended,security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
