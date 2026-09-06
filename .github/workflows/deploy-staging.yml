@@ -1,0 +1,158 @@
+# Deploy — Staging
+#
+# §7.2: "Merge to develop → auto-deploy to staging environment."
+#
+# Staging is not a convenience here. §9.1 requires the final demonstration to
+# run on the deployed staging environment, and states that an unresolved live
+# failure during the demonstration is a failed demonstration. A staging
+# environment that is deployed to for the first time in Week 15 is a
+# demonstration that discovers its problems in front of the panel.
+#
+# So this runs on every merge to develop, from the first one.
+
+name: Deploy — Staging
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: "Image tag to deploy (defaults to the commit sha)"
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Image tag to deploy"
+        type: string
+        default: ""
+    secrets:
+      STAGING_HOST:      { required: true }
+      STAGING_USER:      { required: true }
+      STAGING_SSH_KEY:   { required: true }
+      STAGING_ENV_FILE:  { required: true }
+
+# Deployments queue rather than cancel. Cancelling a half-finished deployment
+# leaves the environment in a state nobody chose.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    name: Publish Images
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      app-ref: develop
+      image-tag: staging
+    secrets: inherit
+
+  deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: images
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Deploy
+        id: deploy
+        uses: ./
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          user: ${{ secrets.STAGING_USER }}
+          ssh-private-key: ${{ secrets.STAGING_SSH_KEY }}
+          environment: staging
+          compose-file: compose/docker-compose.staging.yml
+          remote-path: ${{ vars.STAGING_PATH || '/opt/sri-ko-lms-staging' }}
+          # The commit sha, not `staging`. An immutable tag means the rollback
+          # target is an exact image rather than whatever the moving tag
+          # pointed at when the previous deployment ran.
+          image-tag: ${{ inputs.image-tag || format('sha-{0}', github.sha) }}
+          backend-image: ${{ secrets.DOCKERHUB_USERNAME }}/sri-ko-lms-backend
+          frontend-image: ${{ secrets.DOCKERHUB_USERNAME }}/sri-ko-lms-frontend
+          env-file: ${{ secrets.STAGING_ENV_FILE }}
+          smoke-test-url: ${{ vars.STAGING_URL }}
+          smoke-test-api-url: ${{ vars.STAGING_API_URL }}
+          rollback-on-failure: "true"
+
+      - name: Summary
+        if: always()
+        env:
+          STATUS: ${{ steps.deploy.outputs.status }}
+          TAG: ${{ steps.deploy.outputs.deployed-tag }}
+          PREVIOUS: ${{ steps.deploy.outputs.previous-tag }}
+          URL: ${{ vars.STAGING_URL }}
+        run: |
+          {
+            echo "## Staging"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Status | \`${STATUS:-unknown}\` |"
+            echo "| Tag | \`${TAG:-—}\` |"
+            echo "| Previous | \`${PREVIOUS:-none}\` |"
+            echo "| URL | ${URL:-not configured} |"
+            echo ""
+            echo "Commit: ${GITHUB_SHA}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The full suite against the deployed environment, not against a container
+  # started inside the CI job. It is the only thing that exercises the real
+  # TLS termination, the real CORS configuration and the real database — the
+  # three that differ between a compose stack and a deployment, and therefore
+  # the three that break in Week 15.
+  verify:
+    name: End-to-End Against Staging
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: success()
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the testing repository
+        uses: actions/checkout@v6
+        with:
+          repository: TeamNova-SRI-KO-LMS/testing
+          ref: develop
+          token: ${{ secrets.APP_REPO_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - run: npx playwright install --with-deps chromium
+
+      - name: Run the end-to-end suite against staging
+        env:
+          E2E_EXTERNAL: "true"
+          E2E_FRONTEND_URL: ${{ vars.STAGING_URL }}
+          E2E_BACKEND_URL: ${{ vars.STAGING_API_URL }}
+        run: npm run test:e2e
+
+      - name: Upload the Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-staging-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+          if-no-files-found: ignore
