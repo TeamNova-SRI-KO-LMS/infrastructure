@@ -1,0 +1,43 @@
+# Secrets. §7: never committed, even to a private repository.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/testdata/*.key
+id_rsa*
+*.p12
+*.pfx
+
+# Deployment state, written on the host by scripts/deploy.sh
+.deployed-tag
+.deployment-history
+rollback-*.log
+failed-deployment.log
+
+# Backups
+backups/
+*.gz
+*.dump
+
+# Node
+node_modules/
+npm-debug.log*
+*.tsbuildinfo
+.npm
+
+# Build output and scan artefacts
+dist/
+*.tar
+*.tar.gz
+trivy-*.sarif
+*.sbom.json
+pack.json
+audit.json
+outdated.json
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
