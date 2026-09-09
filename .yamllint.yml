@@ -1,0 +1,50 @@
+# yamllint configuration.
+#
+# GitHub Actions workflows are YAML that is written to be read by people under
+# time pressure, so the rules that fight that — line length, comment
+# indentation, quoting style — are relaxed. The rules that catch real
+# breakage are kept and are errors.
+
+extends: default
+
+rules:
+  # Workflow expressions and long `run:` lines routinely exceed any sensible
+  # limit, and breaking them makes them harder to read, not easier.
+  line-length: disable
+
+  # A duplicate key silently discards one of the two values. This is the rule
+  # that catches a step with two `env:` blocks.
+  key-duplicates: enable
+
+  comments:
+    require-starting-space: true
+    min-spaces-from-content: 1
+
+  comments-indentation: disable
+
+  # GitHub Actions requires `on:` — which YAML 1.1 parses as the boolean true.
+  # Every workflow would otherwise fail this rule.
+  truthy:
+    allowed-values: ["true", "false", "on", "off"]
+    check-keys: false
+
+  document-start: disable
+
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+
+  braces:
+    max-spaces-inside: 1
+
+  brackets:
+    max-spaces-inside: 1
+
+  empty-lines:
+    max: 2
+    max-start: 0
+    max-end: 1
+
+ignore: |
+  node_modules/
+  .git/

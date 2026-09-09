@@ -1,0 +1,64 @@
+{
+  "name": "@teamnova-sri-ko-lms/infrastructure",
+  "version": "1.0.0",
+  "description": "Infrastructure as code for the SRI-KO Learning Management System \u2014 Dockerfiles, Compose stacks, CI/CD workflows, deployment scripts, and the SRI-KO LMS Stack Deploy action",
+  "license": "UNLICENSED",
+  "private": false,
+  "author": "TeamNova \u00b7 University of Kelaniya",
+  "homepage": "https://github.com/TeamNova-SRI-KO-LMS/infrastructure#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TeamNova-SRI-KO-LMS/infrastructure.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TeamNova-SRI-KO-LMS/infrastructure/issues"
+  },
+  "keywords": [
+    "docker",
+    "docker-compose",
+    "github-actions",
+    "ci-cd",
+    "deployment",
+    "mern",
+    "infrastructure-as-code"
+  ],
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
+  },
+  "files": [
+    "action.yml",
+    "compose/",
+    "docker/",
+    "scripts/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "scripts": {
+    "lint": "npm run lint:yaml && npm run lint:shell && npm run lint:docker",
+    "lint:yaml": "yamllint --strict .",
+    "lint:shell": "shellcheck --severity=warning scripts/*.sh",
+    "lint:docker": "hadolint docker/*.Dockerfile",
+    "lint:actions": "actionlint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "validate": "node scripts/validate.js",
+    "compose:config": "for f in compose/docker-compose*.yml; do docker compose --env-file .env.example -f \"$f\" config --quiet || exit 1; done && echo '\u2713 every compose stack resolves'",
+    "up": "docker compose -f compose/docker-compose.yml up -d --wait",
+    "down": "docker compose -f compose/docker-compose.yml down",
+    "logs": "docker compose -f compose/docker-compose.yml logs -f",
+    "smoke": "./scripts/smoke-test.sh",
+    "verify": "npm run format:check && npm run validate && npm run compose:config",
+    "build:backend": "docker build -f docker/backend.Dockerfile --target runtime -t sri-ko-lms-backend:local \"${APP_PATH:-../../SRI-KO_Application_Project/SRI-KO_LMS_MERN}\"",
+    "build:frontend": "docker build -f docker/frontend.Dockerfile --target runtime --build-context infra=. -t sri-ko-lms-frontend:local \"${APP_PATH:-../../SRI-KO_Application_Project/SRI-KO_LMS_MERN}\""
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "js-yaml": "^4.1.0"
+  }
+}

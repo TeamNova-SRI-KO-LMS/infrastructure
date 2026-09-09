@@ -1,0 +1,14 @@
+Copyright (c) 2026 TeamNova — University of Kelaniya
+
+Coursework produced for SENG 34213 (System Development Project), Software
+Engineering Teaching Unit, Faculty of Science, University of Kelaniya.
+
+All rights reserved. This material is submitted for academic assessment and is
+not licensed for redistribution, modification or commercial use.
+
+Permission is granted to the Software Engineering Teaching Unit, the assessing
+panel, and the project client to use, copy and evaluate this material for the
+purposes of assessment and of operating the delivered system.
+
+Third-party components retain their own licences. See package-lock.json and the
+base images referenced in docker/ for the terms that apply to them.

@@ -1,0 +1,20 @@
+# Applies when this repository is a build context. The important entries are
+# the first block: a .env copied into an image is a secret published to
+# everyone who can pull it.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+
+.git
+.github
+node_modules
+backups
+docs
+*.md
+!README.md
+.deployed-tag
+.deployment-history
+*.log
