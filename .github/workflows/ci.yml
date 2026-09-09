@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the infrastructure
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -108,7 +108,7 @@ jobs:
             dockerfile: docker/frontend.Dockerfile
     steps:
       - name: Check out the infrastructure
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: infrastructure
 
@@ -117,7 +117,7 @@ jobs:
       # here is what makes "does this Dockerfile still build?" a question CI
       # can answer.
       - name: Check out the application
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.APP_REPOSITORY }}
           ref: ${{ env.APP_REF }}
@@ -176,7 +176,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # `docker compose config` resolves interpolation, merges anchors and
       # validates the schema. It is the closest thing a compose file has to a
@@ -231,7 +231,7 @@ jobs:
     needs: [build, validate]
     steps:
       - name: Check out the infrastructure
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download images
         uses: actions/download-artifact@v8
@@ -281,7 +281,7 @@ jobs:
       matrix:
         tier: [backend, frontend]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download image
         uses: actions/download-artifact@v8
@@ -326,7 +326,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # gitleaks needs history: a secret removed in the tip commit is still
           # a compromised secret, and it is still in every clone.
