@@ -88,12 +88,12 @@ jobs:
 
     steps:
       - name: Check out the infrastructure
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: infrastructure
 
       - name: Check out the application
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.APP_REPOSITORY }}
           ref: ${{ inputs.app-ref || 'develop' }}
@@ -222,7 +222,7 @@ jobs:
           - hub-image: sri-ko-lms-frontend
             readme: docs/images/frontend.md
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Push README to Docker Hub
         uses: peter-evans/dockerhub-description@v4

@@ -46,7 +46,7 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
       notes: ${{ steps.notes.outputs.path }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -170,7 +170,7 @@ jobs:
     permissions:
       contents: write        # to create the release
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download release notes
         uses: actions/download-artifact@v8

@@ -42,7 +42,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       major: ${{ steps.version.outputs.major }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Resolve the version
         id: version
@@ -146,7 +146,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: validate
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Calling the action with deliberately invalid input and asserting it
       # *fails* is the cheapest end-to-end check available: it exercises the
@@ -181,7 +181,7 @@ jobs:
     permissions:
       contents: write        # to move the major-version tag
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
