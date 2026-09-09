@@ -1,0 +1,81 @@
+# CI stack — boots the images the pipeline just built and checks they work
+# together.
+#
+#   docker compose -f compose/docker-compose.ci.yml up -d --wait
+#
+# Distinct from docker-compose.test.yml, which *builds* from source for local
+# end-to-end runs. This one only ever runs images that already exist, because
+# the question it answers is "does the artefact CI produced actually run?" —
+# and rebuilding here would answer a different question.
+#
+# Nothing is persisted, nothing is published beyond the two ports the smoke
+# test needs, and the credentials are fixed fakes: this stack never holds real
+# data, and a CI job cannot read a secret it does not have.
+
+name: sri-ko-lms-ci
+
+services:
+  mongo:
+    image: mongo:7
+    tmpfs:
+      - /data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+    networks: [ci]
+
+  api:
+    image: ${BACKEND_IMAGE:-sri-ko-lms-backend}:${IMAGE_TAG:-ci}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 5001
+      MONGODB_URI: mongodb://mongo:27017/sriko_lms_ci
+      JWT_SECRET: ci-only-not-a-real-secret
+      SESSION_SECRET: ci-only-not-a-real-secret
+      JWT_EXPIRE: 1d
+      FRONTEND_URL: http://localhost:8080
+      CORS_ORIGIN: http://localhost:8080
+      LOG_LEVEL: error
+      HTTPS_ENABLE: "false"
+    ports:
+      - "5001:5001"
+    # The image's own HEALTHCHECK drives `--wait`; repeating it here would let
+    # the two definitions drift. It is restated only to shorten the interval,
+    # because a CI job should not spend 30 seconds discovering a healthy
+    # container.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get({host:'127.0.0.1',port:5001,path:'/health',timeout:4000},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+    networks: [ci]
+
+  web:
+    image: ${FRONTEND_IMAGE:-sri-ko-lms-frontend}:${IMAGE_TAG:-ci}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks: [ci]
+
+networks:
+  ci:
+    driver: bridge
