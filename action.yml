@@ -1,0 +1,398 @@
+# GitHub Marketplace Action
+# SRI-KO LMS — Stack Deploy
+#
+# Deploys the SRI-KO LMS container stack to a remote Docker host over SSH,
+# waits for every container to report healthy, smoke-tests the result, and
+# rolls back to the previous image tag if the smoke test fails.
+#
+# The rollback is the reason this exists as an action rather than a shell step
+# in one workflow. A deploy step that pushes a new tag and stops has a failure
+# mode where the environment is left broken and the job is green, or broken and
+# the job is red — and in both cases somebody has to log in and fix it by hand
+# at whatever hour it happened. Recording the tag that was running, and putting
+# it back automatically when the health check says the new one is not serving,
+# turns that into a red build and an environment that is still up.
+
+name: "SRI-KO LMS Stack Deploy"
+description: "Deploy the SRI-KO LMS container stack over SSH with health checks, smoke tests and automatic rollback."
+author: "TeamNova · University of Kelaniya"
+
+branding:
+  icon: "upload-cloud"
+  color: "blue"
+
+inputs:
+  host:
+    description: "Hostname or IP address of the target Docker host."
+    required: true
+  user:
+    description: "SSH user on the target host."
+    required: false
+    default: "deploy"
+  ssh-private-key:
+    description: "SSH private key with access to the host. Pass a secret, never a literal."
+    required: true
+  ssh-port:
+    description: "SSH port on the target host."
+    required: false
+    default: "22"
+  environment:
+    description: "Which environment is being deployed: staging or production."
+    required: false
+    default: "staging"
+  compose-file:
+    description: "Compose file to deploy, relative to this action's repository."
+    required: false
+    default: "compose/docker-compose.staging.yml"
+  remote-path:
+    description: "Directory on the host that holds the stack."
+    required: false
+    default: "/opt/sri-ko-lms"
+  image-tag:
+    description: "Tag of the images to deploy. Use an immutable tag (a version or a sha-) rather than a moving one."
+    required: true
+  backend-image:
+    description: "Backend image repository, without the tag."
+    required: false
+    default: "teamnova/sri-ko-lms-backend"
+  frontend-image:
+    description: "Frontend image repository, without the tag."
+    required: false
+    default: "teamnova/sri-ko-lms-frontend"
+  env-file:
+    description: "Base64-encoded .env file for the stack. Pass a secret; it is written with mode 600 and removed on failure."
+    required: false
+    default: ""
+  health-timeout:
+    description: "Seconds to wait for every container to report healthy."
+    required: false
+    default: "180"
+  smoke-test-url:
+    description: "Public URL of the web tier. When set, the smoke test runs against it after the deployment."
+    required: false
+    default: ""
+  smoke-test-api-url:
+    description: "Public URL of the API. Defaults to <smoke-test-url>/api."
+    required: false
+    default: ""
+  rollback-on-failure:
+    description: "Roll back to the previously deployed tag if the health check or smoke test fails."
+    required: false
+    default: "true"
+  prune:
+    description: "Remove unused images on the host after a successful deployment."
+    required: false
+    default: "true"
+
+outputs:
+  deployed-tag:
+    description: "The image tag that is now running."
+    value: ${{ steps.deploy.outputs.deployed-tag }}
+  previous-tag:
+    description: "The tag that was running before this deployment. Use it to roll back by hand."
+    value: ${{ steps.record.outputs.previous-tag }}
+  status:
+    description: "success, rolled-back, or failed."
+    value: ${{ steps.result.outputs.status }}
+  duration:
+    description: "Deployment duration in seconds."
+    value: ${{ steps.result.outputs.duration }}
+
+runs:
+  using: composite
+
+  steps:
+    # ── Refuse obviously wrong input before touching the host ────────────────
+    - name: Validate inputs
+      id: validate
+      shell: bash
+      env:
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        COMPOSE_FILE: ${{ inputs.compose-file }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${IMAGE_TAG}" ]; then
+          echo "::error::image-tag is required."
+          exit 1
+        fi
+
+        # A moving tag makes a deployment unreproducible and a rollback
+        # meaningless: `latest` today is not `latest` tomorrow, so there is
+        # nothing to roll back *to*. Refused for production, warned about
+        # elsewhere.
+        case "${IMAGE_TAG}" in
+          latest|main|master|develop)
+            if [ "${ENVIRONMENT}" = "production" ]; then
+              echo "::error::Refusing to deploy the moving tag '${IMAGE_TAG}' to production. Use a version (1.2.3) or a digest tag (sha-...)."
+              exit 1
+            fi
+            echo "::warning::'${IMAGE_TAG}' is a moving tag. A rollback from this deployment cannot name an exact image."
+            ;;
+        esac
+
+        case "${ENVIRONMENT}" in
+          staging|production) ;;
+          *)
+            echo "::error::environment must be 'staging' or 'production', got '${ENVIRONMENT}'."
+            exit 1
+            ;;
+        esac
+
+        if [ ! -f "${GITHUB_ACTION_PATH}/${COMPOSE_FILE}" ]; then
+          echo "::error::compose file '${COMPOSE_FILE}' not found in the action repository."
+          exit 1
+        fi
+
+        echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+        echo "✓ inputs valid — deploying ${IMAGE_TAG} to ${ENVIRONMENT}"
+
+    - name: Configure SSH
+      shell: bash
+      env:
+        SSH_KEY: ${{ inputs.ssh-private-key }}
+        HOST: ${{ inputs.host }}
+        SSH_PORT: ${{ inputs.ssh-port }}
+      run: |
+        set -euo pipefail
+
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+
+        printf '%s\n' "${SSH_KEY}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+
+        # Scanning the host key rather than disabling StrictHostKeyChecking.
+        # Turning the check off makes every deployment vulnerable to a
+        # man-in-the-middle for the convenience of not managing one file.
+        ssh-keyscan -p "${SSH_PORT}" -H "${HOST}" >> ~/.ssh/known_hosts 2>/dev/null
+
+        cat >> ~/.ssh/config <<CONFIG
+        Host deploy-target
+          HostName ${HOST}
+          Port ${SSH_PORT}
+          IdentityFile ~/.ssh/deploy_key
+          StrictHostKeyChecking yes
+          UserKnownHostsFile ~/.ssh/known_hosts
+          ServerAliveInterval 30
+          ConnectTimeout 15
+        CONFIG
+        chmod 600 ~/.ssh/config
+
+        echo "✓ ssh configured for ${HOST}:${SSH_PORT}"
+
+    # ── What is running now? This is the rollback target ─────────────────────
+    - name: Record the current deployment
+      id: record
+      shell: bash
+      env:
+        SSH_USER: ${{ inputs.user }}
+        REMOTE_PATH: ${{ inputs.remote-path }}
+      run: |
+        set -euo pipefail
+
+        previous="$(ssh "${SSH_USER}@deploy-target" \
+          "cat '${REMOTE_PATH}/.deployed-tag' 2>/dev/null || true" | tr -d '\r\n')"
+
+        if [ -z "${previous}" ]; then
+          echo "::notice::No previous deployment recorded on the host. Rollback will not be available for this deployment."
+        else
+          echo "Currently deployed: ${previous}"
+        fi
+
+        echo "previous-tag=${previous}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload the stack definition
+      shell: bash
+      env:
+        SSH_USER: ${{ inputs.user }}
+        REMOTE_PATH: ${{ inputs.remote-path }}
+        COMPOSE_FILE: ${{ inputs.compose-file }}
+        ENV_FILE_B64: ${{ inputs.env-file }}
+      run: |
+        set -euo pipefail
+
+        ssh "${SSH_USER}@deploy-target" "mkdir -p '${REMOTE_PATH}/docker'"
+
+        scp "${GITHUB_ACTION_PATH}/${COMPOSE_FILE}" \
+          "${SSH_USER}@deploy-target:${REMOTE_PATH}/docker-compose.yml"
+
+        # The mongo init scripts and nginx config the compose file mounts.
+        scp -r "${GITHUB_ACTION_PATH}/docker/mongo" \
+          "${SSH_USER}@deploy-target:${REMOTE_PATH}/docker/" 2>/dev/null || true
+
+        if [ -n "${ENV_FILE_B64}" ]; then
+          # Written through a pipe with a restrictive umask so the secret never
+          # exists on disk in a world-readable state, not even briefly.
+          printf '%s' "${ENV_FILE_B64}" | base64 -d | \
+            ssh "${SSH_USER}@deploy-target" \
+              "umask 077 && cat > '${REMOTE_PATH}/.env' && chmod 600 '${REMOTE_PATH}/.env'"
+          echo "✓ environment file installed (mode 600)"
+        else
+          echo "::notice::No env-file supplied. The host must already have ${REMOTE_PATH}/.env."
+        fi
+
+        echo "✓ stack definition uploaded to ${REMOTE_PATH}"
+
+    - name: Deploy
+      id: deploy
+      shell: bash
+      env:
+        SSH_USER: ${{ inputs.user }}
+        REMOTE_PATH: ${{ inputs.remote-path }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        BACKEND_IMAGE: ${{ inputs.backend-image }}
+        FRONTEND_IMAGE: ${{ inputs.frontend-image }}
+        HEALTH_TIMEOUT: ${{ inputs.health-timeout }}
+      run: |
+        set -euo pipefail
+
+        ssh "${SSH_USER}@deploy-target" bash -euo pipefail <<REMOTE
+        cd '${REMOTE_PATH}'
+
+        export IMAGE_TAG='${IMAGE_TAG}'
+        export BACKEND_IMAGE='${BACKEND_IMAGE}'
+        export FRONTEND_IMAGE='${FRONTEND_IMAGE}'
+
+        echo "── pulling ${IMAGE_TAG}"
+        # Pulling before "up" keeps the window in which the old container is
+        # stopped and the new image is still downloading down to nothing.
+        docker compose pull --quiet
+
+        echo "── starting"
+        # --wait blocks until every healthcheck passes; without it the command
+        # returns the moment the containers are *created*, and a container that
+        # crashes on start looks like a successful deployment.
+        docker compose up -d --wait --wait-timeout ${HEALTH_TIMEOUT} --remove-orphans
+
+        echo "── running containers"
+        docker compose ps
+        REMOTE
+
+        echo "deployed-tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+        echo "✓ stack is up and healthy"
+
+    - name: Smoke test
+      id: smoke
+      if: inputs.smoke-test-url != ''
+      shell: bash
+      env:
+        WEB_URL: ${{ inputs.smoke-test-url }}
+        API_URL: ${{ inputs.smoke-test-api-url }}
+      run: |
+        set -euo pipefail
+        api="${API_URL:-${WEB_URL}/api}"
+        chmod +x "${GITHUB_ACTION_PATH}/scripts/smoke-test.sh"
+        "${GITHUB_ACTION_PATH}/scripts/smoke-test.sh" "${WEB_URL}" "${api}"
+
+    # ── Recovery ─────────────────────────────────────────────────────────────
+    - name: Roll back
+      id: rollback
+      if: failure() && inputs.rollback-on-failure == 'true' && steps.record.outputs.previous-tag != ''
+      shell: bash
+      env:
+        SSH_USER: ${{ inputs.user }}
+        REMOTE_PATH: ${{ inputs.remote-path }}
+        PREVIOUS_TAG: ${{ steps.record.outputs.previous-tag }}
+        BACKEND_IMAGE: ${{ inputs.backend-image }}
+        FRONTEND_IMAGE: ${{ inputs.frontend-image }}
+        HEALTH_TIMEOUT: ${{ inputs.health-timeout }}
+      run: |
+        set -euo pipefail
+
+        echo "::warning::Deployment failed. Rolling back to ${PREVIOUS_TAG}."
+
+        # Capture the logs of the failed deployment before replacing it —
+        # otherwise the rollback destroys the only evidence of why it failed.
+        ssh "${SSH_USER}@deploy-target" \
+          "cd '${REMOTE_PATH}' && docker compose logs --no-color --tail=300" \
+          > failed-deployment.log 2>&1 || true
+
+        ssh "${SSH_USER}@deploy-target" bash -euo pipefail <<REMOTE
+        cd '${REMOTE_PATH}'
+        export IMAGE_TAG='${PREVIOUS_TAG}'
+        export BACKEND_IMAGE='${BACKEND_IMAGE}'
+        export FRONTEND_IMAGE='${FRONTEND_IMAGE}'
+        docker compose pull --quiet
+        docker compose up -d --wait --wait-timeout ${HEALTH_TIMEOUT} --remove-orphans
+        docker compose ps
+        REMOTE
+
+        echo "✓ rolled back to ${PREVIOUS_TAG}"
+
+    - name: Upload the failed deployment's logs
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: failed-deployment-logs-${{ inputs.environment }}
+        path: failed-deployment.log
+        retention-days: 14
+        if-no-files-found: ignore
+
+    # ── Bookkeeping ──────────────────────────────────────────────────────────
+    - name: Record the deployed tag
+      if: success()
+      shell: bash
+      env:
+        SSH_USER: ${{ inputs.user }}
+        REMOTE_PATH: ${{ inputs.remote-path }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        PRUNE: ${{ inputs.prune }}
+      run: |
+        set -euo pipefail
+
+        # Written only after everything passed, so the recorded tag is always a
+        # tag that was observed working — which is what makes it safe to roll
+        # back to.
+        ssh "${SSH_USER}@deploy-target" \
+          "printf '%s\n' '${IMAGE_TAG}' > '${REMOTE_PATH}/.deployed-tag'"
+
+        if [ "${PRUNE}" = "true" ]; then
+          # `--filter until=168h` keeps a week of images on the host, so a
+          # rollback to last week's tag does not have to re-pull.
+          ssh "${SSH_USER}@deploy-target" \
+            "docker image prune -af --filter 'until=168h'" || true
+        fi
+
+    - name: Result
+      id: result
+      if: always()
+      shell: bash
+      env:
+        START: ${{ steps.validate.outputs.start }}
+        DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+        SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+        ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        PREVIOUS_TAG: ${{ steps.record.outputs.previous-tag }}
+      run: |
+        set -euo pipefail
+
+        duration=$(( $(date +%s) - ${START:-$(date +%s)} ))
+        echo "duration=${duration}" >> "$GITHUB_OUTPUT"
+
+        if [ "${ROLLBACK_OUTCOME}" = "success" ]; then
+          status="rolled-back"
+        elif [ "${DEPLOY_OUTCOME}" = "success" ] && [ "${SMOKE_OUTCOME}" != "failure" ]; then
+          status="success"
+        else
+          status="failed"
+        fi
+        echo "status=${status}" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "## Deployment — ${ENVIRONMENT}"
+          echo ""
+          echo "| | |"
+          echo "| --- | --- |"
+          echo "| Status | \`${status}\` |"
+          echo "| Tag | \`${IMAGE_TAG}\` |"
+          echo "| Previous | \`${PREVIOUS_TAG:-none}\` |"
+          echo "| Duration | ${duration}s |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Cleared regardless of outcome. A private key left in the runner's
+        # home directory outlives the step that needed it.
+        rm -f ~/.ssh/deploy_key
