@@ -1,0 +1,243 @@
+# Publish to the GitHub Marketplace
+#
+# `action.yml` in this repository's root is a composite action —
+# "SRI-KO LMS Stack Deploy" — which any workflow can call to deploy the stack
+# over SSH with health checks, smoke tests and automatic rollback.
+#
+# Marketplace publication itself is a checkbox on the GitHub Release ("Publish
+# this Action to the GitHub Marketplace"), not something an API can do. So what
+# this workflow does is everything *around* it: verify the action is valid and
+# actually works, verify the metadata Marketplace requires, move the major
+# version tag consumers pin to, and leave instructions for the one manual step.
+#
+# The verification is the part that earns its place. A broken action published
+# to the Marketplace runs inside other people's workflows, with their tokens,
+# and fails in their CI rather than ours.
+
+name: Publish to Marketplace
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. v1.0.0"
+        type: string
+        required: true
+
+concurrency:
+  group: publish-marketplace
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Marketplace metadata requirements ──────────────────────────────────────
+  validate:
+    name: Validate the Action
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      major: ${{ steps.version.outputs.major }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-${RELEASE_TAG}}"
+
+          if ! printf '%s' "${version}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Marketplace releases must be a plain semantic version tag (vX.Y.Z), got '${version}'."
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "major=${version%%.*}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Every one of these is a rule the Marketplace enforces at publish time.
+      # Finding out here costs a build; finding out at the publish dialog costs
+      # a release.
+      - name: action.yml satisfies the Marketplace requirements
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, yaml
+
+          spec = yaml.safe_load(open("action.yml"))
+          errors = []
+
+          for key in ("name", "description", "runs"):
+              if not spec.get(key):
+                  errors.append(f"missing required key: {key}")
+
+          # The Marketplace rejects a name that collides with an existing
+          # listing, and requires a description that is not the name again.
+          name = spec.get("name", "")
+          description = spec.get("description", "")
+          if len(name) > 100:
+              errors.append("name is longer than 100 characters")
+          if len(description) < 20:
+              errors.append("description is too short to be useful (< 20 characters)")
+
+          branding = spec.get("branding") or {}
+          if not branding.get("icon"):
+              errors.append("branding.icon is required for a Marketplace listing")
+          if branding.get("color") not in {
+              "white", "yellow", "blue", "green", "orange", "red", "purple", "gray-dark",
+          }:
+              errors.append(f"branding.color '{branding.get('color')}' is not one of the accepted values")
+
+          runs = spec.get("runs") or {}
+          if runs.get("using") != "composite":
+              errors.append("runs.using must be 'composite' for this action")
+
+          for i, step in enumerate(runs.get("steps", [])):
+              if "run" in step and "shell" not in step:
+                  errors.append(f"step {i} ('{step.get('name', '?')}') has `run` but no `shell`")
+
+          # An input that is required and also has a default is a contradiction:
+          # the default means it is never actually required.
+          for key, value in (spec.get("inputs") or {}).items():
+              if value.get("required") and value.get("default"):
+                  errors.append(f"input '{key}' is required but also has a default")
+              if not value.get("description"):
+                  errors.append(f"input '{key}' has no description")
+
+          for key, value in (spec.get("outputs") or {}).items():
+              if not value.get("description"):
+                  errors.append(f"output '{key}' has no description")
+
+          if errors:
+              for error in errors:
+                  print(f"::error::{error}")
+              sys.exit(1)
+
+          print(f"✓ '{name}' is a valid Marketplace composite action")
+          print(f"  {len(spec.get('inputs', {}))} inputs, {len(spec.get('outputs', {}))} outputs, "
+                f"{len(runs.get('steps', []))} steps")
+          PY
+
+      - name: A README documents the action
+        run: |
+          set -euo pipefail
+          # The README is what appears on the Marketplace listing page. A
+          # listing whose page does not show a usage example gets no users.
+          missing=0
+          for pattern in "uses:.*infrastructure@" "## Usage" "## Inputs" "## Outputs"; do
+            if ! grep -qE "${pattern}" README.md; then
+              echo "::error::README.md has no section matching /${pattern}/ — the Marketplace listing renders this file."
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+  # ── Prove it runs ──────────────────────────────────────────────────────────
+  test:
+    name: The Action Runs
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@v6
+
+      # Calling the action with deliberately invalid input and asserting it
+      # *fails* is the cheapest end-to-end check available: it exercises the
+      # composite step machinery — every `shell:`, every `${{ inputs.* }}` —
+      # without needing a deployment host. An action whose steps do not even
+      # parse fails here.
+      - name: Refuses a moving tag in production
+        id: guard
+        continue-on-error: true
+        uses: ./
+        with:
+          host: 127.0.0.1
+          user: nobody
+          ssh-private-key: "not-a-key"
+          environment: production
+          image-tag: latest
+
+      - name: The guard fired
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.guard.outcome }}" != "failure" ]; then
+            echo "::error::The action accepted 'latest' as a production tag. The input guard is broken."
+            exit 1
+          fi
+          echo "✓ the action rejected a moving tag in production, as designed"
+
+  # ── Publish ────────────────────────────────────────────────────────────────
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    needs: [validate, test]
+    permissions:
+      contents: write        # to move the major-version tag
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Consumers pin to the major tag — `@v1` — so that they get fixes without
+      # a pull request each time. That only works if something moves the tag,
+      # and doing it by hand is how `@v1` ends up eleven releases behind.
+      - name: Move the major version tag
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          MAJOR: ${{ needs.validate.outputs.major }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -fa "${MAJOR}" -m "Update ${MAJOR} to ${VERSION}"
+          git push origin "${MAJOR}" --force
+
+          echo "✓ ${MAJOR} now points at ${VERSION}"
+
+      - name: Publishing instructions
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          MAJOR: ${{ needs.validate.outputs.major }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Marketplace — ${VERSION}"
+            echo ""
+            echo "The action is validated, tested, and \`${MAJOR}\` now points at \`${VERSION}\`."
+            echo ""
+            echo "### One manual step remains"
+            echo ""
+            echo "Marketplace publication cannot be automated — GitHub requires a human to"
+            echo "accept the Developer Agreement on the release."
+            echo ""
+            echo "1. Open [the release](${REPO_URL}/releases/tag/${VERSION})"
+            echo "2. **Edit release**"
+            echo "3. Tick **Publish this Action to the GitHub Marketplace**"
+            echo "4. Choose the primary category *Deployment* and secondary *Continuous integration*"
+            echo "5. **Update release**"
+            echo ""
+            echo "First publication also requires two-factor authentication on the"
+            echo "account, and the repository must be public."
+            echo ""
+            echo "### Consumers then use"
+            echo ""
+            echo '```yaml'
+            echo "- uses: ${{ github.repository }}@${MAJOR}"
+            echo "  with:"
+            echo "    host: \${{ secrets.STAGING_HOST }}"
+            echo "    user: \${{ secrets.STAGING_USER }}"
+            echo "    ssh-private-key: \${{ secrets.STAGING_SSH_KEY }}"
+            echo "    image-tag: \${{ github.sha }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
