@@ -59,7 +59,7 @@ RUN npm run build
 # ── Stage 3: runtime ────────────────────────────────────────────────────────
 # nginx-unprivileged runs as uid 101 and listens on 8080, so no capability to
 # bind a privileged port is needed and the container has no root process.
-FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
+FROM nginxinc/nginx-unprivileged:1.31-alpine AS runtime
 
 # The nginx config lives in the infrastructure repository, and the build
 # context is the *application* repository — so it is not reachable by a plain
