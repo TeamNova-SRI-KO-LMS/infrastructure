@@ -1,0 +1,104 @@
+# Production stack.
+#
+#   docker compose -f compose/docker-compose.prod.yml up -d
+#
+# Deployed only from a tagged release on `main`, through
+# .github/workflows/deploy-production.yml, which requires a manual approval on
+# the `production` environment.
+#
+# Two differences from staging that matter:
+#
+#   * There is no MongoDB service. Production runs on managed MongoDB with
+#     backups, monitoring and a replica set — none of which a compose-managed
+#     container in a single host provides. MONGODB_URI points at it.
+#   * Every container is read-only, drops all capabilities, and cannot gain
+#     privileges. The application writes to exactly one path (/app/uploads)
+#     and nginx to its cache and run directories; those are tmpfs or volumes.
+#     Anything else that tries to write is a bug or an intrusion, and either
+#     way it should fail.
+
+name: sri-ko-lms
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-hardening: &hardening
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  api:
+    image: ${BACKEND_IMAGE:?}:${IMAGE_TAG:?}
+    restart: always
+    logging: *default-logging
+    <<: *hardening
+    environment:
+      NODE_ENV: production
+      PORT: 5001
+      MONGODB_URI: ${MONGODB_URI:?}
+      JWT_SECRET: ${JWT_SECRET:?}
+      JWT_EXPIRE: ${JWT_EXPIRE:-7d}
+      SESSION_SECRET: ${SESSION_SECRET:?}
+      FRONTEND_URL: ${FRONTEND_URL:?}
+      CORS_ORIGIN: ${CORS_ORIGIN:?}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      LOG_LEVEL: ${LOG_LEVEL:-warn}
+      HTTPS_ENABLE: "false" # TLS terminates at the edge
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - api-uploads:/app/uploads
+    expose:
+      - "5001"
+    deploy:
+      replicas: ${API_REPLICAS:-2}
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+        reservations: { cpus: "0.25", memory: 192M }
+      update_config:
+        order: start-first # new container healthy before the old one stops
+        failure_action: rollback
+        delay: 10s
+      rollback_config:
+        order: start-first
+    networks: [sriko]
+
+  web:
+    image: ${FRONTEND_IMAGE:?}:${IMAGE_TAG:?}
+    restart: always
+    logging: *default-logging
+    <<: *hardening
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/cache/nginx:size=32m
+      - /var/run:size=4m
+    deploy:
+      replicas: ${WEB_REPLICAS:-2}
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+        reservations: { cpus: "0.1", memory: 64M }
+      update_config:
+        order: start-first
+        failure_action: rollback
+        delay: 5s
+    networks: [sriko]
+
+volumes:
+  # In a multi-host deployment this must be shared storage, or uploads written
+  # by one replica are invisible to the other. The durable fix is object
+  # storage — see docs/RUNBOOK.md, "Uploads are on local disk".
+  api-uploads:
+
+networks:
+  sriko:
+    driver: bridge
