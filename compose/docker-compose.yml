@@ -1,0 +1,114 @@
+# Local development stack.
+#
+#   docker compose -f compose/docker-compose.yml up
+#
+# Brings up MongoDB, the API and the web tier on one network, with the
+# application source bind-mounted so a save reloads. This is the stack a new
+# team member runs on their first day; it must work from a clean clone with
+# nothing installed but Docker.
+#
+# `APP_PATH` points at the application repository. It defaults to the
+# conventional sibling checkout, so the common case needs no configuration.
+#
+# **Run compose from the repository root**, as the README and the npm scripts
+# do:
+#
+#     docker compose -f compose/docker-compose.yml up -d --wait
+#
+# The build context is the *application* repository, and Compose resolves a
+# relative `dockerfile:` against the context — so the Dockerfiles, which live
+# here, have to be named by an absolute path. `${PWD}` supplies it. If you
+# need to run compose from somewhere else, set INFRA_ROOT to this repository's
+# absolute path.
+
+name: sri-ko-lms-dev
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: sriko-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-sriko_lms}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-sriko_app}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?set MONGO_APP_PASSWORD in .env}
+    ports:
+      # Exposed so Compass and the test harness can reach it. Not exposed in
+      # the staging or production stacks.
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo-data:/data/db
+      - ../docker/mongo/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [sriko]
+
+  api:
+    build:
+      context: ${APP_PATH:-../../../SRI-KO_Application_Project/app}
+      dockerfile: ${INFRA_ROOT:-${PWD}}/docker/backend.Dockerfile
+      target: runtime
+      additional_contexts:
+        infra: ..
+      args:
+        BACKEND_DIR: ${BACKEND_DIR:-Backend}
+    container_name: sriko-api
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 5001
+      # The app user, not root — the same principle the production connection
+      # string follows.
+      MONGODB_URI: mongodb://${MONGO_APP_USERNAME:-sriko_app}:${MONGO_APP_PASSWORD}@mongo:27017/${MONGO_DATABASE:-sriko_lms}?authSource=${MONGO_DATABASE:-sriko_lms}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      JWT_EXPIRE: ${JWT_EXPIRE:-7d}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:5173}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      LOG_LEVEL: ${LOG_LEVEL:-debug}
+      HTTPS_ENABLE: "false"
+    ports:
+      - "${API_PORT:-5001}:5001"
+    volumes:
+      - api-uploads:/app/uploads
+    networks: [sriko]
+
+  web:
+    build:
+      context: ${APP_PATH:-../../../SRI-KO_Application_Project/app}
+      dockerfile: ${INFRA_ROOT:-${PWD}}/docker/frontend.Dockerfile
+      target: runtime
+      additional_contexts:
+        infra: ..
+      args:
+        FRONTEND_DIR: ${FRONTEND_DIR:-Frontend}
+        # Points at the proxy path rather than the API container directly, so
+        # the browser sees one origin and CORS is not involved locally.
+        VITE_API_URL: /api
+        VITE_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+        VITE_NODE_ENV: development
+    container_name: sriko-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT:-5173}:8080"
+    networks: [sriko]
+
+volumes:
+  mongo-data:
+  api-uploads:
+
+networks:
+  sriko:
+    driver: bridge
