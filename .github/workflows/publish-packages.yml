@@ -1,0 +1,158 @@
+# Publish to GitHub Packages
+#
+# Two artefacts, one registry, different reasons:
+#
+#   npm   @teamnova-sri-ko-lms/infrastructure — the compose files, deployment
+#         scripts and Dockerfiles as a versioned tarball. The point is that a
+#         deployment host can fetch an exact version of the deployment
+#         definition instead of `git pull`-ing a branch and hoping it matches
+#         the images it is about to run.
+#
+#   ghcr  the container images. Published here as well as to Docker Hub so
+#         that a deployment still works when the Docker Hub credentials expire
+#         or its rate limit is hit — GHCR authenticates with the workflow's own
+#         token, which cannot expire separately from the repository.
+#
+# Both are versioned from the git tag, so `infrastructure@1.2.3` and
+# `sri-ko-lms-backend:1.2.3` describe the same commit.
+
+name: Publish to GitHub Packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 1.0.0 (no leading v)"
+        type: string
+        required: true
+      dry-run:
+        description: "Pack and inspect without publishing"
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-packages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: Publish npm Package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write        # provenance
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node.js for GitHub Packages
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: https://npm.pkg.github.com
+          scope: "@teamnova-sri-ko-lms"
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Set the version from the tag
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          version="${INPUT_VERSION:-${RELEASE_TAG#v}}"
+
+          if ! printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'${version}' is not a semantic version."
+            exit 1
+          fi
+
+          # --no-git-tag-version because the tag already exists; npm creating a
+          # second one would leave two tags for one release.
+          npm version "${version}" --no-git-tag-version --allow-same-version
+          echo "✓ package version set to ${version}"
+
+      # `npm pack --dry-run` lists exactly what would ship. Worth asserting
+      # rather than trusting `files`: a package that accidentally includes a
+      # .env, or omits the compose files it exists to distribute, is only
+      # visible here.
+      - name: Inspect the package contents
+        run: |
+          set -euo pipefail
+
+          npm pack --dry-run --json > pack.json
+          python3 - <<'PY'
+          import json, sys
+
+          entry = json.load(open("pack.json"))[0]
+          names = {f["path"] for f in entry["files"]}
+
+          required = {
+              "action.yml",
+              "compose/docker-compose.prod.yml",
+              "compose/docker-compose.staging.yml",
+              "docker/backend.Dockerfile",
+              "docker/frontend.Dockerfile",
+              "scripts/deploy.sh",
+              "scripts/rollback.sh",
+              "scripts/smoke-test.sh",
+              "README.md",
+          }
+
+          missing = sorted(required - names)
+          if missing:
+              for path in missing:
+                  print(f"::error::the package is missing {path}")
+              sys.exit(1)
+
+          # Nothing that could carry a credential ships in a published package.
+          forbidden = sorted(
+              n for n in names
+              if n.startswith(".env") or n.endswith((".key", ".pem")) or "secret" in n.lower()
+          )
+          if forbidden:
+              for path in forbidden:
+                  print(f"::error::refusing to publish: {path} looks like a secret")
+              sys.exit(1)
+
+          print(f"✓ {entry['name']}@{entry['version']} — {len(names)} files, "
+                f"{entry['unpackedSize'] // 1024} KB unpacked")
+          PY
+
+      - name: Publish
+        if: inputs.dry-run != true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish --provenance --access restricted
+
+      - name: Summary
+        run: |
+          {
+            echo "### npm package"
+            echo ""
+            echo '```bash'
+            echo "npm install @teamnova-sri-ko-lms/infrastructure"
+            echo '```'
+            echo ""
+            echo "Requires an .npmrc pointing @teamnova-sri-ko-lms at npm.pkg.github.com."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  containers:
+    name: Publish Container Images
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      app-ref: ${{ github.event.release.tag_name || 'develop' }}
+      image-tag: ${{ inputs.version || '' }}
+    secrets: inherit
