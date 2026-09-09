@@ -1,0 +1,106 @@
+# Copilot code review
+#
+# §5.3 requires at least one peer review on every pull request, with all
+# `[blocker]` comments resolved before merge. Copilot does not satisfy that —
+# a machine reviewer is not a peer, and this workflow does not mark anything as
+# approved. What it does is take the first pass, so that the human reviewer
+# arrives after the obvious things have already been raised.
+#
+# That division is the point. Copilot is reliable on the mechanical checks that
+# are tedious to do by hand and easy to skip when tired: an unpinned action, a
+# missing `permissions` block, a container running as root, a secret pasted
+# into a default value. Human review is for the questions Copilot cannot ask —
+# is this the right design, does this match what the issue asked for, will
+# whoever is on call at 2 a.m. understand this.
+#
+# Review guidance lives in .github/copilot-instructions.md, which Copilot reads
+# before commenting.
+#
+# Requires Copilot code review to be enabled for the organisation:
+#   Settings → Copilot → Code review
+
+name: Copilot Code Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+    branches: [develop, main]
+
+concurrency:
+  group: copilot-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  request-review:
+    name: Request Copilot Review
+    runs-on: ubuntu-latest
+    # A draft is work in progress. Reviewing it produces comments on code the
+    # author already knows is unfinished, which is how a review bot becomes
+    # something people mute.
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Add Copilot as a reviewer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # The reviewer is requested through the REST API rather than the
+          # `gh pr edit --add-reviewer` shorthand, because Copilot is a bot
+          # account and has to go in the `reviewers` array by its login.
+          if gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
+            -f "reviewers[]=copilot-pull-request-reviewer[bot]" >/dev/null 2>&1
+          then
+            echo "✓ Copilot review requested on #${PR_NUMBER}"
+          else
+            # Not a failure. Copilot code review is a plan-dependent feature,
+            # and a pipeline that goes red because an optional reviewer is
+            # unavailable teaches the team that red means nothing.
+            echo "::notice::Could not request a Copilot review. This is expected if Copilot code review is not enabled for the organisation (Settings → Copilot → Code review). Human review is still required by §5.3."
+          fi
+
+      - name: Remind about the human review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Posted once, on open. A bot that comments on every push is a bot
+          # whose comments get collapsed.
+          marker="<!-- review-policy-reminder -->"
+
+          if gh api "/repos/${REPO}/issues/${PR_NUMBER}/comments" --jq '.[].body' \
+             | grep -qF "${marker}"; then
+            echo "Reminder already posted."
+            exit 0
+          fi
+
+          {
+            printf '%s\n' "${marker}"
+            printf 'Copilot has been asked to take the first pass over this change.\n\n'
+            printf '**That does not satisfy §5.3.** A merge to `develop` still needs at\n'
+            printf 'least one approving review from a person, and every `[blocker]`\n'
+            printf 'comment resolved.\n\n'
+            printf 'Reviewer checklist for this repository:\n\n'
+            printf -- '- [ ] No secret, token or connection string in the diff — including defaults and examples\n'
+            printf -- '- [ ] Every workflow declares `permissions:` and grants the minimum\n'
+            printf -- '- [ ] No untrusted PR input interpolated into a `run:` block\n'
+            printf -- '- [ ] Actions pinned to a release tag or a commit SHA\n'
+            printf -- '- [ ] Any new container runs as a non-root user\n'
+            printf -- '- [ ] Anything touching deployment has a stated rollback\n'
+          } > reminder.md
+
+          gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file reminder.md
