@@ -65,7 +65,7 @@ jobs:
           pyflakes: false
 
       - name: Lint Dockerfiles (hadolint)
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@v3.5.0
         with:
           recursive: true
           dockerfile: "docker/*.Dockerfile"
@@ -296,7 +296,7 @@ jobs:
       # only on HIGH and CRITICAL with a fix available. Failing on an
       # unfixable CVE teaches the team to bypass the gate.
       - name: Scan ${{ matrix.tier }} (report)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: sri-ko-lms-${{ matrix.tier }}:ci
           format: sarif
@@ -312,7 +312,7 @@ jobs:
         continue-on-error: true
 
       - name: Scan ${{ matrix.tier }} (gate — §8.1 A06)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: sri-ko-lms-${{ matrix.tier }}:ci
           format: table

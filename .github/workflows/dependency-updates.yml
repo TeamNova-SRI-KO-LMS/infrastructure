@@ -162,7 +162,7 @@ jobs:
       # without anything in this repository changing. Scanning them on a
       # schedule is the only way to find out before a release does.
       - name: Scan ${{ matrix.image }}
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ matrix.image }}
           format: table
