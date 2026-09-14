@@ -183,7 +183,7 @@ jobs:
       # finding here is a finding about something real rather than about a
       # local build that may differ.
       - name: Scan the published image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.REGISTRY_GHCR }}/${{ github.repository_owner }}/${{ matrix.hub-image }}@${{ steps.push.outputs.digest }}
           format: table
