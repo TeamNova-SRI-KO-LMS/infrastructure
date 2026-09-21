@@ -58,7 +58,7 @@
     "build:frontend": "docker build -f docker/frontend.Dockerfile --target runtime --build-context infra=. -t sri-ko-lms-frontend:local \"${APP_PATH:-../../SRI-KO_Application_Project/SRI-KO_LMS_MERN}\""
   },
   "devDependencies": {
-    "prettier": "^3.3.3",
+    "prettier": "^3.9.8",
     "js-yaml": "^4.1.0"
   }
 }
